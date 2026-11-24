@@ -1,0 +1,1 @@
+# Coarse-Grained-Simulation-of-Compression-and-Auxetic-Response-in-a-3D-Woven-Re-entrant-Lattice
