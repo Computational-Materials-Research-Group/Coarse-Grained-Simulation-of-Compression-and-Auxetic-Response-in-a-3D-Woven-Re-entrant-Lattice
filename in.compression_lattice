@@ -1,0 +1,116 @@
+# Uniaxial COMPRESSION test (along z, perpendicular to the ribs) of a 3D woven
+# re-entrant (auxetic) lattice, to 50 % strain.
+# Beam network: LAMMPS BPM package, bond_style bpm/rotational, lj units (lengths in mm)
+# Files from build_reentrant_woven.py: woven_lattice.data, woven_lattice.bonds
+#
+#   mpirun -np 16 lmp -in in.compression_lattice                     (parallel, recommended)
+#   lmp -in in.compression_lattice -var strain 0.3 -var erate 5e-5    (override settings)
+
+variable        erate  index 1.0e-4       # nominal compressive strain rate
+variable        strain index 0.50         # final engineering (compressive) strain
+variable        dt0    index auto         # timestep; auto = stable value written by the builder
+variable        kn     index auto         # contact stiffness; auto = scaled with the fibre diameter
+variable        mu     index 0.3          # fibre-fibre friction coefficient (0 = frictionless)
+variable        visc   index 0.0          # optional background damping (fix viscous), 0 = off
+variable        grip   index 1.5          # thickness of the gripped rows at bottom and top
+variable        edge   index 5.0          # width of the left/right probe bands for lateral strain
+variable        dstrn  index 0.01         # strain between dump frames (1 % -> 51 frames)
+variable        ostrn  index 0.001        # strain between stress-strain rows
+
+units           lj
+dimension       3
+boundary        s s s
+atom_style      bpm/sphere
+newton          on off
+comm_modify     vel yes cutoff 4.0
+special_bonds   lj 0.0 1.0 1.0 coul 1.0 1.0 1.0
+read_data       woven_lattice.data
+
+# ---- interactions -------------------------------------------------------
+# beams: stretch, shear, twist, bend; break when the combined load ratio reaches 1
+bond_style      bpm/rotational normalize yes
+include         woven_lattice.bonds       # bond coefficients, v_dfib, v_kn0, v_dtauto
+
+if "${kn} == auto" then "variable knc equal ${kn0}" else "variable knc equal ${kn}"
+if "${dt0} == auto" then "variable dtc equal ${dtauto}" else "variable dtc equal ${dt0}"
+
+# frictional contact between different fibres (Hooke normal + Coulomb friction);
+# contact distance = sum of bead radii = fibre diameter
+pair_style      granular
+pair_coeff      * * hooke ${knc} 0.5 tangential linear_history $(0.5*v_knc) 1.0 ${mu}
+
+neighbor        ${dfib} bin
+neigh_modify    every 1 delay 0 check yes exclude molecule/intra all   # no self-contact within a fibre
+timestep        ${dtc}
+
+# ---- grips (platens bonded to the end rib rows): bottom and top ----------------
+variable        zmin  equal bound(all,zmin)
+variable        zmax  equal bound(all,zmax)
+variable        zB    equal ${zmin}+${grip}
+variable        zT    equal ${zmax}-${grip}
+region          rB block INF INF INF INF INF ${zB}
+region          rT block INF INF INF INF ${zT} INF
+group           gripB region rB
+group           gripT region rT
+group           grips union gripB gripT
+group           mobile subtract all grips
+
+variable        Lg    equal ${zT}-${zB}
+variable        W     equal bound(all,xmax)-bound(all,xmin)
+variable        D     equal bound(all,ymax)-bound(all,ymin)
+variable        A0    equal $(v_W)*$(v_D)
+
+# ---- lateral strain probes: left and right edge bands at mid-height ---------
+variable        xL    equal bound(all,xmin)+${edge}
+variable        xR    equal bound(all,xmax)-${edge}
+variable        zM1   equal ${zB}+0.3*${Lg}
+variable        zM2   equal ${zT}-0.3*${Lg}
+region          rL block INF ${xL} INF INF ${zM1} ${zM2}
+region          rR block ${xR} INF INF INF ${zM1} ${zM2}
+group           edgeL region rL
+group           edgeR region rR
+variable        w0    equal xcm(edgeR,x)-xcm(edgeL,x)
+variable        w0f   equal ${w0}
+
+# ---- run length and output intervals from strain --------------------------------
+variable        nsteps equal round(${strain}/(${erate}*${dtc}))
+variable        ndump  equal round(${dstrn}/(${erate}*${dtc}))
+variable        nraw   equal round(${ostrn}/(${erate}*${dtc}))
+if "${nraw} < 100" then "variable nout equal 100" else "variable nout equal 10*round(${nraw}/10)"
+print           "gauge length ${Lg}, nominal area ${A0}, probe width ${w0f}"
+print           "timestep ${dtc}, contact stiffness ${knc}, steps ${nsteps}, dump every ${ndump}"
+
+# ---- loading: top grip moves down, bottom grip fixed -------------------------
+variable        vpush equal ${erate}*${Lg}
+fix             mvB gripB move linear 0.0 0.0 0.0
+fix             mvT gripT move linear 0.0 0.0 -${vpush}
+fix             int mobile nve/bpm/sphere
+velocity        mobile ramp vz 0.0 -${vpush} z ${zB} ${zT} sum yes
+if "${visc} > 0" then "fix damp mobile viscous ${visc}"
+
+variable        d0     equal xcm(gripT,z)-xcm(gripB,z)
+variable        d0f    equal ${d0}
+variable        strainc equal (v_d0f-(xcm(gripT,z)-xcm(gripB,z)))/v_Lg    # compressive strain > 0
+compute         fT gripT reduce sum fz
+compute         fB gripB reduce sum fz
+variable        force  equal 0.5*(c_fT-c_fB)                               # compressive force > 0
+variable        stress equal v_force/v_A0                                   # compressive stress > 0
+variable        latstr equal (xcm(edgeR,x)-xcm(edgeL,x)-v_w0f)/v_w0f       # lateral strain (x)
+variable        poisson equal -v_latstr/(-v_strainc+1.0e-12)              # nu = -eps_x/eps_z
+compute         nb all nbond/atom
+compute         nbtot all reduce sum c_nb
+variable        bonds  equal c_nbtot/2
+compute         ke mobile ke
+
+fix             ss all ave/time 10 10 ${nout} v_strainc v_stress v_force v_latstr v_poisson v_bonds file stress_strain.txt
+thermo_style    custom step v_strainc v_stress v_latstr v_poisson v_bonds c_ke
+thermo          ${ndump}
+
+# per-bead stress (pair + bond) for colouring in OVITO; bonds dumped so broken ones vanish
+compute         sa all stress/atom NULL pair bond
+dump            d1 all custom ${ndump} lattice.dump id mol type x y z c_nb c_sa[3]
+dump_modify     d1 sort id colname c_sa[3] szz      # szz = stress x volume (zz)
+compute         bt all property/local batom1 batom2 btype
+dump            d2 all local ${ndump} lattice_bonds.dump index c_bt[1] c_bt[2] c_bt[3]
+
+run             ${nsteps}
